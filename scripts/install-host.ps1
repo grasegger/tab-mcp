@@ -12,13 +12,17 @@ $HostDir    = Join-Path $RepoDir "native-host"
 
 Write-Host "==> Installing npm dependencies in native-host/ ..."
 Push-Location $HostDir
-npm install --omit=dev
+if (Test-Path (Join-Path $HostDir "package-lock.json")) {
+  npm ci --omit=dev
+} else {
+  npm install --omit=dev
+}
 Pop-Location
 
-# Create wrapper batch file
+# Create wrapper batch file (UTF-8 so the file is valid ASCII/UTF-8 on all Windows versions)
 $WrapperPath = Join-Path $HostDir "run.bat"
 $IndexPath   = Join-Path $HostDir "index.js"
-Set-Content -Path $WrapperPath -Value "@echo off`r`nnode `"$IndexPath`" %*"
+Set-Content -Path $WrapperPath -Value "@echo off`r`nnode `"$IndexPath`" %*" -Encoding UTF8
 
 # Native messaging manifest destination (per-user HKCU)
 $ManifestDir  = Join-Path $env:APPDATA "Mozilla\NativeMessagingHosts"
@@ -26,9 +30,9 @@ New-Item -ItemType Directory -Force -Path $ManifestDir | Out-Null
 $ManifestDest = Join-Path $ManifestDir "tab_mcp_host.json"
 
 # Read template and substitute path (use forward slashes for JSON safety)
-$Template = Get-Content (Join-Path $HostDir "host-manifest.json") -Raw
+$Template = Get-Content (Join-Path $HostDir "host-manifest.json") -Raw -Encoding UTF8
 $Template  = $Template -replace "PATH_PLACEHOLDER", ($WrapperPath -replace "\\", "/")
-Set-Content -Path $ManifestDest -Value $Template
+Set-Content -Path $ManifestDest -Value $Template -Encoding UTF8
 
 # Register in Windows registry so Firefox can discover it
 $RegPath = "HKCU:\Software\Mozilla\NativeMessagingHosts\tab_mcp_host"

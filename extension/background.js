@@ -21,6 +21,11 @@
 /** @type {number|null} Tab ID currently exposed via MCP (null = none selected). */
 let selectedTabId = null;
 
+// Native messaging messages are capped at 1 MB by Firefox.  Leave headroom for
+// the JSON envelope by capping the content fields conservatively.
+const MAX_HTML_BYTES = 800_000;      // ~800 KB of HTML text
+const MAX_SCREENSHOT_B64 = 700_000; // ~700 KB of base64 data-URL string
+
 // ---------------------------------------------------------------------------
 // Native messaging
 // ---------------------------------------------------------------------------
@@ -93,14 +98,26 @@ async function pushTabSnapshot(tab) {
       }).catch(() => [""]),
       browser.tabs.captureVisibleTab(tab.windowId, { format: "png" }).catch(() => null),
     ]);
+
+    let html = (htmlResults && htmlResults[0]) || "";
+    if (html.length > MAX_HTML_BYTES) {
+      html = html.slice(0, MAX_HTML_BYTES) + "\n<!-- tab-mcp: HTML truncated -->";
+    }
+
+    let screenshotDataUrl = dataUrl || null;
+    if (screenshotDataUrl && screenshotDataUrl.length > MAX_SCREENSHOT_B64) {
+      console.warn("tab-mcp: screenshot too large for native messaging, dropping from push");
+      screenshotDataUrl = null;
+    }
+
     nativePort.postMessage({
       type: "tab_selected",
       tab: {
         id: tab.id,
         url: tab.url,
         title: tab.title || "",
-        html: (htmlResults && htmlResults[0]) || "",
-        screenshotDataUrl: dataUrl || null,
+        html,
+        screenshotDataUrl,
       },
     });
   } catch (err) {
@@ -184,6 +201,10 @@ async function handleNativeMessage(message) {
     }
     try {
       const dataUrl = await browser.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+      if (dataUrl.length > MAX_SCREENSHOT_B64) {
+        reply(id, { error: "Screenshot too large to send via native messaging. Try a smaller viewport." });
+        return;
+      }
       reply(id, { dataUrl });
     } catch (err) {
       reply(id, { error: err.message });
@@ -201,7 +222,11 @@ async function handleNativeMessage(message) {
       const results = await browser.tabs.executeScript(tab.id, {
         code: "document.documentElement.outerHTML",
       });
-      reply(id, { html: results ? (results[0] || "") : "" });
+      let html = results ? (results[0] || "") : "";
+      if (html.length > MAX_HTML_BYTES) {
+        html = html.slice(0, MAX_HTML_BYTES) + "\n<!-- tab-mcp: HTML truncated -->";
+      }
+      reply(id, { html });
     } catch (err) {
       reply(id, { error: err.message });
     }

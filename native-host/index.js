@@ -198,7 +198,34 @@ function createMcpServer() {
 // ---------------------------------------------------------------------------
 
 const app = express();
-app.use(cors({ origin: "*" }));
+
+// CORS: only allow explicitly configured origins.
+// Set TAB_MCP_ALLOWED_ORIGINS to a comma-separated list of allowed origins.
+// If the variable is unset or empty, no CORS headers are sent (browser
+// cross-origin requests will be blocked, which is the safe default).
+const allowedOriginsEnv = process.env.TAB_MCP_ALLOWED_ORIGINS;
+const allowedOrigins = allowedOriginsEnv
+  ? allowedOriginsEnv.split(",").map((o) => o.trim()).filter(Boolean)
+  : [];
+
+if (allowedOrigins.length > 0) {
+  app.use(
+    cors({
+      origin(origin, callback) {
+        // Only allow explicitly configured origins. Requests without an Origin
+        // header (e.g. non-browser clients such as curl) do not get CORS headers.
+        if (!origin) {
+          return callback(null, false);
+        }
+        if (allowedOrigins.includes(origin)) {
+          return callback(null, true);
+        }
+        return callback(new Error("Not allowed by CORS"));
+      },
+    })
+  );
+}
+
 app.use(express.json());
 
 app.all("/mcp", async (req, res) => {

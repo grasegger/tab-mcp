@@ -13,7 +13,7 @@ jobs:
     name: Build & package
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # needed for creating GitHub releases on tags; read-only otherwise
+      contents: read
 
     steps:
       - name: Checkout repository
@@ -55,11 +55,26 @@ jobs:
           path: dist/tab-mcp.zip
           if-no-files-found: error
 
-      # -----------------------------------------------------------------------
-      # On version tags: create a GitHub release and attach the zip
-      # -----------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # On version tags only: create a GitHub release and attach the zip.
+  # Runs in a separate job so `contents: write` is not granted to the build job.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tab-mcp
+          path: dist
+
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/tab-mcp.zip

@@ -18,7 +18,11 @@ HOST_DIR="$REPO_DIR/native-host"
 
 echo "==> Installing npm dependencies in native-host/ ..."
 cd "$HOST_DIR"
-npm install --omit=dev
+if [ -f package-lock.json ]; then
+  npm ci --omit=dev
+else
+  npm install --omit=dev
+fi
 
 # Create the wrapper script that Firefox will launch
 WRAPPER="$HOST_DIR/run.sh"
