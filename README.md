@@ -1,14 +1,23 @@
 # tab-mcp
 
-A Firefox browser extension that exposes the **active tab** to AI agents via a **local MCP server** (read-only).
+A Firefox browser extension that lets you expose **one browser tab** to AI agents via a **local MCP server** (read-only).
 
-The extension has three tools:
+Click the **tab-mcp toolbar button** on any tab to select it — the icon turns green to confirm. The MCP server then makes that tab's content available. Click the button again to deselect.
+
+The extension exposes three read-only tools:
 
 | Tool | Description |
 |------|-------------|
-| `get_title` | Return the title of the active tab |
-| `get_screenshot` | Capture a PNG screenshot of the visible tab |
-| `get_html` | Return the full outer-HTML of the active tab |
+| `get_title` | Return the title of the selected tab |
+| `get_screenshot` | Capture a PNG screenshot of the selected tab |
+| `get_html` | Return the full outer-HTML of the selected tab |
+
+## How it works
+
+1. Click the **tab-mcp toolbar button** on the tab you want to expose — it turns green
+2. The extension immediately sends a snapshot (title, HTML, screenshot) to the native host
+3. An AI agent calls `get_title`, `get_screenshot`, or `get_html` via the MCP server
+4. Click the button again (or close the tab) to stop exposing it
 
 ## Architecture
 
@@ -22,7 +31,7 @@ AI agent ──(MCP HTTP)──► native-host/index.js :3712
                        browser tab APIs
 ```
 
-The Firefox extension connects to a **native messaging host** (a small Node.js process) that starts an HTTP MCP server on `http://127.0.0.1:3712/mcp`. When an AI agent calls a tool, the host asks the extension to use browser APIs to fetch the data and returns the result.
+The Firefox extension connects to a **native messaging host** (a small Node.js process) that starts an HTTP MCP server on `http://127.0.0.1:3712/mcp`. When the user clicks the toolbar button, the extension proactively pushes a snapshot to the host so MCP tool calls are answered instantly.
 
 ## Requirements
 
@@ -63,17 +72,21 @@ The script:
 2. Click **"This Firefox"** → **"Load Temporary Add-on…"**
 3. Select `extension/manifest.json`
 
-The extension icon should appear in the toolbar and the native host process starts automatically.
+The **tab-mcp** icon (blue "T") should appear in the toolbar. The native host process starts automatically when the extension loads.
 
-### 4. Verify the MCP server is running
+### 4. Select a tab to expose
+
+Navigate to the tab you want to expose, then click the **tab-mcp toolbar button**. The icon turns **green** and shows an **ON** badge, indicating that tab is now selected. Click again to deselect.
+
+### 5. Verify the MCP server is running
 
 ```bash
 curl http://127.0.0.1:3712/
 ```
 
-Expected response:
+Expected response (once a tab is selected):
 ```json
-{"name":"tab-mcp","version":"0.1.0","mcp_endpoint":"http://127.0.0.1:3712/mcp"}
+{"name":"tab-mcp","version":"0.1.0","mcp_endpoint":"http://127.0.0.1:3712/mcp","selected_tab":{"id":42,"title":"Example Domain","url":"https://example.com"}}
 ```
 
 ## Configuring an MCP client

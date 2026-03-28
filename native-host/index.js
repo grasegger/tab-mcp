@@ -9,12 +9,15 @@
  *      on stdin/stdout so the extension can send tab data back.
  *   2. Runs an HTTP MCP server (Streamable-HTTP transport) on localhost:${PORT}
  *      so AI agents can connect and call the read-only tools:
- *        • get_title      – title of the active tab
- *        • get_screenshot – base64-encoded PNG screenshot
- *        • get_html       – full outer-HTML of the active tab
+ *        • get_title      – title of the tab selected by the user via the toolbar button
+ *        • get_screenshot – base64-encoded PNG screenshot of the selected tab
+ *        • get_html       – full outer-HTML of the selected tab
+ *
+ * When the user clicks the toolbar button, the extension proactively sends a
+ * "tab_selected" message with the full snapshot (title, html, screenshotDataUrl).
+ * This host caches that snapshot so MCP tools can serve it instantly.
  */
 
-import { randomUUID } from "node:crypto";
 import express from "express";
 import cors from "cors";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -34,6 +37,13 @@ let msgBuffer = Buffer.alloc(0);
 let nextId = 0;
 /** @type {Map<number, { resolve: (v: any) => void, timer: ReturnType<typeof setTimeout> }>} */
 const pending = new Map();
+
+/**
+ * Cached snapshot pushed by the extension when the user clicks the toolbar
+ * button.  null = no tab selected yet.
+ * @type {{ id: number, url: string, title: string, html: string, screenshotDataUrl: string|null }|null}
+ */
+let cachedTab = null;
 
 // Firefox writes binary to stdin; set it to read raw buffers.
 process.stdin.resume();
@@ -69,6 +79,19 @@ function sendToExtension(msg) {
 }
 
 function handleFromExtension(msg) {
+  // Push notifications from the extension (no id → not a reply to a request).
+  if (msg.type === "tab_selected") {
+    cachedTab = msg.tab;
+    process.stderr.write(`[tab-mcp] tab selected: "${msg.tab.title}" (id=${msg.tab.id})\n`);
+    return;
+  }
+  if (msg.type === "tab_deselected" || msg.type === "tab_navigating") {
+    cachedTab = null;
+    process.stderr.write(`[tab-mcp] tab ${msg.type}\n`);
+    return;
+  }
+
+  // Reply to an outstanding request.
   const entry = pending.get(msg.id);
   if (entry) {
     clearTimeout(entry.timer);
@@ -78,7 +101,8 @@ function handleFromExtension(msg) {
 }
 
 /**
- * Ask the extension to perform `type` and return the result.
+ * Ask the extension to perform `type` live and return the result.
+ * Used as a fallback when no cached snapshot is available yet.
  * @param {"get_title"|"get_screenshot"|"get_html"} type
  * @returns {Promise<Record<string, any>>}
  */
@@ -101,19 +125,20 @@ function askExtension(type) {
 const TOOLS = [
   {
     name: "get_title",
-    description: "Return the title of the currently active browser tab.",
+    description:
+      "Return the title of the browser tab currently exposed via the tab-mcp toolbar button.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
   {
     name: "get_screenshot",
     description:
-      "Capture a screenshot of the currently active browser tab and return it as a base64-encoded PNG image.",
+      "Capture a screenshot of the browser tab currently exposed via the tab-mcp toolbar button and return it as a base64-encoded PNG image.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
   {
     name: "get_html",
     description:
-      "Return the full outer-HTML of the currently active browser tab.",
+      "Return the full outer-HTML of the browser tab currently exposed via the tab-mcp toolbar button.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
 ];
@@ -130,21 +155,33 @@ function createMcpServer() {
     const { name } = req.params;
 
     if (name === "get_title") {
+      // Use cached snapshot if available, otherwise ask live.
+      if (cachedTab) {
+        return { content: [{ type: "text", text: cachedTab.title }] };
+      }
       const result = await askExtension("get_title");
       if (result.error) throw new Error(result.error);
       return { content: [{ type: "text", text: result.title ?? "" }] };
     }
 
     if (name === "get_screenshot") {
+      if (cachedTab && cachedTab.screenshotDataUrl) {
+        const base64 = cachedTab.screenshotDataUrl.replace(
+          /^data:image\/\w+;base64,/,
+          ""
+        );
+        return { content: [{ type: "image", data: base64, mimeType: "image/png" }] };
+      }
       const result = await askExtension("get_screenshot");
       if (result.error) throw new Error(result.error);
       const base64 = result.dataUrl.replace(/^data:image\/\w+;base64,/, "");
-      return {
-        content: [{ type: "image", data: base64, mimeType: "image/png" }],
-      };
+      return { content: [{ type: "image", data: base64, mimeType: "image/png" }] };
     }
 
     if (name === "get_html") {
+      if (cachedTab) {
+        return { content: [{ type: "text", text: cachedTab.html }] };
+      }
       const result = await askExtension("get_html");
       if (result.error) throw new Error(result.error);
       return { content: [{ type: "text", text: result.html ?? "" }] };
@@ -213,6 +250,9 @@ app.get("/", (_req, res) => {
     name: "tab-mcp",
     version: "0.1.0",
     mcp_endpoint: `http://localhost:${PORT}/mcp`,
+    selected_tab: cachedTab
+      ? { id: cachedTab.id, title: cachedTab.title, url: cachedTab.url }
+      : null,
   });
 });
 
