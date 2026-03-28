@@ -169,9 +169,42 @@ app.all("/mcp", async (req, res) => {
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined, // stateless
   });
-  res.on("close", () => transport.close());
-  await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
+
+  res.on("close", () => {
+    try {
+      transport.close();
+    } catch {
+      // Ignore errors on close during connection teardown
+    }
+  });
+
+  try {
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    // Ensure errors from async handler do not become unhandled rejections
+    const message =
+      err && typeof err === "object" && "message" in err
+        ? /** @type {{ message?: string }} */ (err).message || "Internal server error"
+        : "Internal server error";
+
+    try {
+      if (!res.headersSent) {
+        res.status(500).json({ error: message });
+      } else {
+        res.end();
+      }
+    } catch {
+      // Ignore secondary errors while attempting to send error response
+    }
+  } finally {
+    try {
+      // Ensure transport is closed even if an error occurs
+      await transport.close();
+    } catch {
+      // Ignore errors during transport close
+    }
+  }
 });
 
 // Health-check / discovery endpoint
