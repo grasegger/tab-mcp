@@ -13,9 +13,10 @@
  *        • get_screenshot – base64-encoded PNG screenshot of the selected tab
  *        • get_html       – full outer-HTML of the selected tab
  *
- * When the user clicks the toolbar button, the extension proactively sends a
- * "tab_selected" message with the full snapshot (title, html, screenshotDataUrl).
- * This host caches that snapshot so MCP tools can serve it instantly.
+ * When the user clicks the toolbar button, the extension sends a multi-message
+ * chunked snapshot (tab_selected_start → tab_chunk… → tab_selected_end) with
+ * the title, HTML, and screenshot.  This host reassembles the chunks and caches
+ * the snapshot so MCP tools can serve it instantly.
  */
 
 import express from "express";
@@ -27,7 +28,22 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-const PORT = process.env.TAB_MCP_PORT ? Number(process.env.TAB_MCP_PORT) : 3712;
+const DEFAULT_PORT = 3712;
+
+function getPortFromEnv() {
+  const raw = process.env.TAB_MCP_PORT;
+  if (!raw) return DEFAULT_PORT;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+    process.stderr.write(
+      `[tab-mcp] Invalid TAB_MCP_PORT value "${raw}". Falling back to default port ${DEFAULT_PORT}.\n`
+    );
+    return DEFAULT_PORT;
+  }
+  return parsed;
+}
+
+const PORT = getPortFromEnv();
 
 // ---------------------------------------------------------------------------
 // Native-messaging bridge (stdin / stdout)
@@ -44,6 +60,15 @@ const pending = new Map();
  * @type {{ id: number, url: string, title: string, html: string, screenshotDataUrl: string|null }|null}
  */
 let cachedTab = null;
+
+// State for assembling the multi-message push snapshot (tab_selected_start/
+// tab_chunk/tab_selected_end).
+let pendingPushTab = null;
+let pendingPushChunks = {};
+
+// State for assembling chunked replies to live requests keyed by request id.
+// Maps id → { field: string, chunks: string[] }
+const pendingReplyChunks = new Map();
 
 // Firefox writes binary to stdin; set it to read raw buffers.
 process.stdin.resume();
@@ -79,24 +104,83 @@ function sendToExtension(msg) {
 }
 
 function handleFromExtension(msg) {
-  // Push notifications from the extension (no id → not a reply to a request).
-  if (msg.type === "tab_selected") {
-    cachedTab = msg.tab;
-    process.stderr.write(`[tab-mcp] tab selected: "${msg.tab.title}" (id=${msg.tab.id})\n`);
+  // ---------------------------------------------------------------------------
+  // Push protocol (no request id): tab_selected_start → tab_chunk… → tab_selected_end
+  // ---------------------------------------------------------------------------
+  if (msg.type === "tab_selected_start") {
+    pendingPushTab = msg.tab;
+    pendingPushChunks = {};
     return;
   }
+
+  if (msg.type === "tab_chunk") {
+    if (!pendingPushTab) {
+      process.stderr.write("[tab-mcp] warning: received tab_chunk without tab_selected_start – ignoring\n");
+      return; // unexpected chunk – ignore
+    }
+    const { field, index, total, data } = msg;
+    if (!pendingPushChunks[field]) {
+      pendingPushChunks[field] = new Array(total).fill("");
+    }
+    pendingPushChunks[field][index] = data;
+    return;
+  }
+
+  if (msg.type === "tab_selected_end") {
+    if (pendingPushTab) {
+      cachedTab = {
+        ...pendingPushTab,
+        html: (pendingPushChunks.html || []).join(""),
+        screenshotDataUrl: (() => {
+          const s = pendingPushChunks.screenshot
+            ? pendingPushChunks.screenshot.join("")
+            : "";
+          return s.length > 0 ? s : null;
+        })(),
+      };
+      process.stderr.write(`[tab-mcp] tab selected: "${cachedTab.title}" (id=${cachedTab.id})\n`);
+      pendingPushTab = null;
+      pendingPushChunks = {};
+    }
+    return;
+  }
+
   if (msg.type === "tab_deselected" || msg.type === "tab_navigating") {
     cachedTab = null;
+    pendingPushTab = null;
+    pendingPushChunks = {};
     process.stderr.write(`[tab-mcp] tab ${msg.type}\n`);
     return;
   }
 
-  // Reply to an outstanding request.
-  const entry = pending.get(msg.id);
-  if (entry) {
-    clearTimeout(entry.timer);
-    pending.delete(msg.id);
-    entry.resolve(msg.result);
+  // ---------------------------------------------------------------------------
+  // Reply protocol: chunked data then a completion signal { id, result: {} }
+  // ---------------------------------------------------------------------------
+
+  // Accumulate a data chunk for an in-flight request reply.
+  if (msg.chunk !== undefined && msg.id !== undefined) {
+    const { id, chunk, total, field, data } = msg;
+    if (!pendingReplyChunks.has(id)) {
+      pendingReplyChunks.set(id, { field, chunks: new Array(total).fill("") });
+    }
+    pendingReplyChunks.get(id).chunks[chunk] = data;
+    return;
+  }
+
+  // Final reply signal: resolve the pending request, assembling any chunks.
+  if (msg.id !== undefined && msg.result !== undefined) {
+    const entry = pending.get(msg.id);
+    if (entry) {
+      clearTimeout(entry.timer);
+      pending.delete(msg.id);
+      let result = msg.result;
+      const replyChunks = pendingReplyChunks.get(msg.id);
+      if (replyChunks) {
+        result = { ...result, [replyChunks.field]: replyChunks.chunks.join("") };
+        pendingReplyChunks.delete(msg.id);
+      }
+      entry.resolve(result);
+    }
   }
 }
 
@@ -220,13 +304,27 @@ if (allowedOrigins.length > 0) {
         if (allowedOrigins.includes(origin)) {
           return callback(null, true);
         }
-        return callback(new Error("Not allowed by CORS"));
+        return callback(null, false);
       },
     })
   );
 }
 
-app.use(express.json());
+app.use(express.json({ limit: "256kb" }));
+
+// Return clear 413/400 responses for oversized or malformed JSON bodies.
+app.use((err, req, res, next) => {
+  if (!err) return next();
+  if (err.type === "entity.too.large") {
+    if (!res.headersSent) return res.status(413).json({ error: "Request body too large" });
+    return res.end();
+  }
+  if (err instanceof SyntaxError && "body" in err) {
+    if (!res.headersSent) return res.status(400).json({ error: "Invalid JSON body" });
+    return res.end();
+  }
+  return next(err);
+});
 
 app.all("/mcp", async (req, res) => {
   const server = createMcpServer();

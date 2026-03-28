@@ -21,10 +21,10 @@
 /** @type {number|null} Tab ID currently exposed via MCP (null = none selected). */
 let selectedTabId = null;
 
-// Native messaging messages are capped at 1 MB by Firefox.  Leave headroom for
-// the JSON envelope by capping the content fields conservatively.
-const MAX_HTML_BYTES = 800_000;      // ~800 KB of HTML text
-const MAX_SCREENSHOT_B64 = 700_000; // ~700 KB of base64 data-URL string
+// Large content is split into chunks so each native messaging message stays
+// within Firefox's 1 MB limit.  700 KB per chunk leaves enough headroom for
+// the JSON envelope and metadata fields.
+const CHUNK_SIZE = 700_000;
 
 // ---------------------------------------------------------------------------
 // Native messaging
@@ -40,6 +40,13 @@ function connect() {
       nativePort = null;
       setTimeout(connect, 3000);
     });
+    // Re-sync: if a tab was already selected, push its snapshot to the
+    // (re-)connected host so the MCP cache is not stale after a restart.
+    if (selectedTabId !== null) {
+      browser.tabs.get(selectedTabId).then(pushTabSnapshot).catch(() => {
+        selectedTabId = null;
+      });
+    }
   } catch (err) {
     console.error("tab-mcp: failed to connect to native host", err);
     setTimeout(connect, 5000);
@@ -50,6 +57,43 @@ function reply(id, result) {
   if (nativePort) {
     nativePort.postMessage({ id, result });
   }
+}
+
+/**
+ * Send `data` as a series of tab_chunk messages (push path, no request id).
+ * The receiver must know the field name to reassemble the chunks.
+ */
+function sendPushChunks(field, data) {
+  const total = Math.max(1, Math.ceil(data.length / CHUNK_SIZE));
+  for (let i = 0; i < total; i++) {
+    nativePort.postMessage({
+      type: "tab_chunk",
+      field,
+      index: i,
+      total,
+      data: data.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE),
+    });
+  }
+}
+
+/**
+ * Reply to a request with large data sent as individual chunks followed by a
+ * completion signal.  The host reassembles chunks before resolving the request.
+ */
+function replyChunked(id, field, data) {
+  if (!nativePort) return;
+  const total = Math.max(1, Math.ceil(data.length / CHUNK_SIZE));
+  for (let i = 0; i < total; i++) {
+    nativePort.postMessage({
+      id,
+      chunk: i,
+      total,
+      field,
+      data: data.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE),
+    });
+  }
+  // Final signal: empty result tells the host all chunks have been sent.
+  nativePort.postMessage({ id, result: {} });
 }
 
 // ---------------------------------------------------------------------------
@@ -99,27 +143,23 @@ async function pushTabSnapshot(tab) {
       browser.tabs.captureVisibleTab(tab.windowId, { format: "png" }).catch(() => null),
     ]);
 
-    let html = (htmlResults && htmlResults[0]) || "";
-    if (html.length > MAX_HTML_BYTES) {
-      html = html.slice(0, MAX_HTML_BYTES) + "\n<!-- tab-mcp: HTML truncated -->";
-    }
+    const html = (htmlResults && htmlResults[0]) || "";
+    const screenshotDataUrl = dataUrl || "";
 
-    let screenshotDataUrl = dataUrl || null;
-    if (screenshotDataUrl && screenshotDataUrl.length > MAX_SCREENSHOT_B64) {
-      console.warn("tab-mcp: screenshot too large for native messaging, dropping from push");
-      screenshotDataUrl = null;
-    }
-
+    // Send lightweight metadata first, then stream content in chunks.
     nativePort.postMessage({
-      type: "tab_selected",
-      tab: {
-        id: tab.id,
-        url: tab.url,
-        title: tab.title || "",
-        html,
-        screenshotDataUrl,
-      },
+      type: "tab_selected_start",
+      tab: { id: tab.id, url: tab.url, title: tab.title || "" },
     });
+
+    sendPushChunks("html", html);
+
+    if (screenshotDataUrl) {
+      sendPushChunks("screenshot", screenshotDataUrl);
+    }
+
+    // Signal that the snapshot is complete and the host can commit it.
+    nativePort.postMessage({ type: "tab_selected_end" });
   } catch (err) {
     console.error("tab-mcp: failed to push snapshot", err);
   }
@@ -150,10 +190,13 @@ browser.browserAction.onClicked.addListener(async (clickedTab) => {
   await pushTabSnapshot(clickedTab);
 });
 
-// If the selected tab is closed or navigates, clear the selection.
+// If the selected tab is closed, clear the selection and notify the native host.
 browser.tabs.onRemoved.addListener((tabId) => {
   if (tabId === selectedTabId) {
     selectedTabId = null;
+    if (nativePort) {
+      nativePort.postMessage({ type: "tab_deselected" });
+    }
   }
 });
 
@@ -200,12 +243,15 @@ async function handleNativeMessage(message) {
       return;
     }
     try {
-      const dataUrl = await browser.tabs.captureVisibleTab(tab.windowId, { format: "png" });
-      if (dataUrl.length > MAX_SCREENSHOT_B64) {
-        reply(id, { error: "Screenshot too large to send via native messaging. Try a smaller viewport." });
+      // captureVisibleTab captures the active (visible) tab in the window, not
+      // an arbitrary tab by id.  Only proceed when the selected tab is active;
+      // otherwise the caller should use the cached snapshot from tab selection.
+      if (!tab.active) {
+        reply(id, { error: "Cannot capture screenshot: selected tab is not currently visible. Switch to the tab first, or use the cached snapshot captured at selection time." });
         return;
       }
-      reply(id, { dataUrl });
+      const dataUrl = await browser.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+      replyChunked(id, "dataUrl", dataUrl);
     } catch (err) {
       reply(id, { error: err.message });
     }
@@ -222,11 +268,8 @@ async function handleNativeMessage(message) {
       const results = await browser.tabs.executeScript(tab.id, {
         code: "document.documentElement.outerHTML",
       });
-      let html = results ? (results[0] || "") : "";
-      if (html.length > MAX_HTML_BYTES) {
-        html = html.slice(0, MAX_HTML_BYTES) + "\n<!-- tab-mcp: HTML truncated -->";
-      }
-      reply(id, { html });
+      const html = results ? (results[0] || "") : "";
+      replyChunked(id, "html", html);
     } catch (err) {
       reply(id, { error: err.message });
     }
