@@ -39,32 +39,71 @@ The Firefox extension connects to a **native messaging host** (a small Node.js p
 - Node.js 18+
 - npm 8+
 
-## Installation
+## Setup
 
-### 1. Clone the repository
+### 1. Install npm dependencies
 
 ```bash
-git clone https://github.com/grasegger/tab-mcp.git
-cd tab-mcp
+cd native-host && npm ci --omit=dev && cd ..
 ```
 
-### 2. Install the native messaging host
+### 2. Register the native messaging host with Firefox
 
-**Linux / macOS**
+Create a wrapper script that Firefox will launch and write the manifest to the location Firefox checks.
+
+**Linux**
+
 ```bash
-bash scripts/install-host.sh
+# Create run.sh (resolves path at runtime so moving the directory still works)
+cat > native-host/run.sh <<'EOF'
+#!/usr/bin/env bash
+exec node "$(cd "$(dirname "$0")" && pwd)/index.js"
+EOF
+chmod +x native-host/run.sh
+
+# Write manifest
+mkdir -p ~/.mozilla/native-messaging-hosts
+sed "s|PATH_PLACEHOLDER|$(pwd)/native-host/run.sh|" \
+    native-host/host-manifest.json \
+    > ~/.mozilla/native-messaging-hosts/tab_mcp_host.json
+```
+
+**macOS**
+
+```bash
+# Create run.sh (resolves path at runtime so moving the directory still works)
+cat > native-host/run.sh <<'EOF'
+#!/usr/bin/env bash
+exec node "$(cd "$(dirname "$0")" && pwd)/index.js"
+EOF
+chmod +x native-host/run.sh
+
+# Write manifest
+mkdir -p "$HOME/Library/Application Support/Mozilla/NativeMessagingHosts"
+sed "s|PATH_PLACEHOLDER|$(pwd)/native-host/run.sh|" \
+    native-host/host-manifest.json \
+    > "$HOME/Library/Application Support/Mozilla/NativeMessagingHosts/tab_mcp_host.json"
 ```
 
 **Windows (PowerShell)**
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\scripts\install-host.ps1
-```
 
-The script:
-- Runs `npm install` inside `native-host/`
-- Creates a wrapper script (e.g. `native-host/run.sh`)
-- Writes the native messaging manifest to the correct OS location so Firefox can find it
+```powershell
+# Create run.bat
+$indexPath = (Resolve-Path native-host\index.js).Path
+Set-Content -Path native-host\run.bat -Value "@echo off`r`nnode `"$indexPath`" %*" -Encoding UTF8
+
+# Write manifest
+$wrapperPath = (Resolve-Path native-host\run.bat).Path -replace '\\','/'
+$dest = "$env:APPDATA\Mozilla\NativeMessagingHosts"
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+(Get-Content native-host\host-manifest.json -Raw -Encoding UTF8) -replace 'PATH_PLACEHOLDER', $wrapperPath |
+    Set-Content "$dest\tab_mcp_host.json" -Encoding UTF8
+
+# Register in the Windows registry
+$regPath = "HKCU:\Software\Mozilla\NativeMessagingHosts\tab_mcp_host"
+New-Item -Path $regPath -Force | Out-Null
+Set-ItemProperty -Path $regPath -Name "(Default)" -Value "$dest\tab_mcp_host.json"
+```
 
 ### 3. Load the extension in Firefox
 
@@ -72,21 +111,17 @@ The script:
 2. Click **"This Firefox"** → **"Load Temporary Add-on…"**
 3. Select `extension/manifest.json`
 
-The **tab-mcp** icon (blue "T") should appear in the toolbar. The native host process starts automatically when the extension loads.
+The **tab-mcp** icon (blue "T") appears in the toolbar. The native host starts automatically when the extension loads.
 
 ### 4. Select a tab to expose
 
-Navigate to the tab you want to expose, then click the **tab-mcp toolbar button**. The icon turns **green** and shows an **ON** badge, indicating that tab is now selected. Click again to deselect.
+Click the **tab-mcp toolbar button** on the tab you want to expose. The icon turns **green** with an **ON** badge. Click again to deselect.
 
-### 5. Verify the MCP server is running
+### 5. Verify
 
 ```bash
 curl http://127.0.0.1:3712/
-```
-
-Expected response (once a tab is selected):
-```json
-{"name":"tab-mcp","version":"0.1.0","mcp_endpoint":"http://127.0.0.1:3712/mcp","selected_tab":{"id":42,"title":"Example Domain","url":"https://example.com"}}
+# {"name":"tab-mcp","version":"0.1.0","mcp_endpoint":"http://127.0.0.1:3712/mcp","selected_tab":{"id":42,"title":"Example Domain","url":"https://example.com"}}
 ```
 
 ## Configuring an MCP client
@@ -113,7 +148,7 @@ To build locally:
 
 ```bash
 cd native-host && npm ci --omit=dev && cd ..
-zip -r tab-mcp.zip extension/ native-host/ scripts/ README.md
+zip -r tab-mcp.zip extension/ native-host/ README.md
 ```
 
 ## Project structure
@@ -128,9 +163,6 @@ tab-mcp/
 │   ├── index.js         # MCP server + native messaging wire protocol
 │   ├── host-manifest.json
 │   └── package.json
-├── scripts/
-│   ├── install-host.sh  # Linux/macOS installer
-│   └── install-host.ps1 # Windows installer
 └── .github/
     └── workflows/
         └── build.yml    # CI: build + upload extension zip

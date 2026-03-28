@@ -35,7 +35,6 @@ jobs:
       # The zip contains:
       #   extension/  – the Firefox WebExtension (manifest + scripts + icons)
       #   native-host/ – the Node.js MCP server (with node_modules)
-      #   scripts/    – install-host.sh / install-host.ps1
       #   README.md
       # -----------------------------------------------------------------------
       - name: Create extension zip
@@ -44,7 +43,6 @@ jobs:
           zip -r dist/tab-mcp.zip \
             extension/ \
             native-host/ \
-            scripts/ \
             README.md \
             --exclude "*.git*"
 
