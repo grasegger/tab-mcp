@@ -1,0 +1,7 @@
+{
+  "name": "tab_mcp_host",
+  "description": "tab-mcp native messaging host – bridges the MCP server to the browser extension",
+  "path": "PATH_PLACEHOLDER",
+  "type": "stdio",
+  "allowed_extensions": ["tab-mcp@grasegger.dev"]
+}
