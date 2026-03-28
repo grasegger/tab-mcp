@@ -197,6 +197,9 @@ browser.tabs.onRemoved.addListener((tabId) => {
     if (nativePort) {
       nativePort.postMessage({ type: "tab_deselected" });
     }
+    if (nativePort) {
+      nativePort.postMessage({ type: "tab_deselected" });
+    }
   }
 });
 
