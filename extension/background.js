@@ -136,11 +136,15 @@ function setButtonState(tabId, isSelected) {
 async function pushTabSnapshot(tab) {
   if (!nativePort) return;
   try {
+    const capturePromise = tab.active
+      ? browser.tabs.captureVisibleTab(tab.windowId, { format: "png" }).catch(() => null)
+      : Promise.resolve(null);
+
     const [htmlResults, dataUrl] = await Promise.all([
       browser.tabs.executeScript(tab.id, {
         code: "document.documentElement.outerHTML",
       }).catch(() => [""]),
-      browser.tabs.captureVisibleTab(tab.windowId, { format: "png" }).catch(() => null),
+      capturePromise,
     ]);
 
     const html = (htmlResults && htmlResults[0]) || "";
@@ -197,17 +201,28 @@ browser.tabs.onRemoved.addListener((tabId) => {
     if (nativePort) {
       nativePort.postMessage({ type: "tab_deselected" });
     }
-    if (nativePort) {
-      nativePort.postMessage({ type: "tab_deselected" });
-    }
   }
 });
 
-browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (tabId === selectedTabId && changeInfo.status === "loading") {
+browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (tabId !== selectedTabId) {
+    return;
+  }
+
+  if (changeInfo.status === "loading") {
     // Tab navigated – update the native host with blank data while loading.
     if (nativePort) {
       nativePort.postMessage({ type: "tab_navigating", tabId });
+    }
+  } else if (changeInfo.status === "complete") {
+    // Navigation finished – push a fresh snapshot so the host cache is updated.
+    if (!nativePort) {
+      return;
+    }
+    if (tab) {
+      pushTabSnapshot(tab);
+    } else {
+      browser.tabs.get(tabId).then(pushTabSnapshot).catch(() => {});
     }
   }
 });

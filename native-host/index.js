@@ -195,6 +195,7 @@ function askExtension(type) {
     const id = ++nextId;
     const timer = setTimeout(() => {
       pending.delete(id);
+      pendingReplyChunks.delete(id);
       reject(new Error(`tab-mcp: request '${type}' timed out`));
     }, 15_000);
     pending.set(id, { resolve, timer });
